@@ -6,10 +6,11 @@ public class RayTracing : MonoBehaviour
 {
     private Nt4Client _ntClient;
     private double robotX = 0.0, robotY = 0.0, robotZ = 0.0, robotRotation = 0.0;
-    private double[,] cameraOffsets = new double[0, 0], cameraPositions = new double[0, 0], parameters = new double[0, 0];
-    private double[][][] cameraAngles = new double[0][][], rayConstants = new double[0][][];
+    private double[][] cameraOffsets = new double[0][], cameraPositions = new double[0][];
+    private int[][] cameraParameters = new int[0][];
+    private double[][][] coralCameraAngles = new double[0][][], algaeCameraAngles = new double[0][][], emptyCameraAngles = new double[0][][], coralRayConstants = new double[0][][], algaeRayConstants = new double[0][][], emptyRayConstants = new double[0][][], coralRawIntersections = new double[0][][], algaeRawIntersections = new double[0][][], emptyRawIntersections = new double[0][][];
     private String alliance = "Blue";
-    private int _cameraOffsetSubscriptionId, _cameraAnglesSubscriptionId, _robotPositionSubscriptionId, _allianceSubscriptionId;
+    private int _cameraOffsetsSubscriptionId, _coralCameraAnglesSubscriptionId, _algaeCameraAnglesSubscriptionId, _emptyCameraAnglesSubscriptionId, _robotPositionSubscriptionId, _allianceSubscriptionId, _cameraParametersSubscriptionId;
 
     // Field Constants
     private const double blueReefX = 4.48945, reedReefX = 13.065, reefY = 4.0259, radius = 0.658;
@@ -57,18 +58,25 @@ public class RayTracing : MonoBehaviour
         _ntClient.Connect();
 
         // Subscribes to relevant topics
-        _cameraOffsetSubscriptionId = _ntClient.Subscribe("cameraOffsets");
-        _cameraAnglesSubscriptionId = _ntClient.Subscribe("cameraAngles");
+        _cameraOffsetsSubscriptionId = _ntClient.Subscribe("cameraOffsets");
+        _coralCameraAnglesSubscriptionId = _ntClient.Subscribe("coralCameraAngles");
+        _algaeCameraAnglesSubscriptionId = _ntClient.Subscribe("coralCameraAngles");
+        _emptyCameraAnglesSubscriptionId = _ntClient.Subscribe("coralCameraAngles");
         _robotPositionSubscriptionId = _ntClient.Subscribe("robotPosition");
         _allianceSubscriptionId = _ntClient.Subscribe("alliance");
+        _cameraParametersSubscriptionId = _ntClient.Subscribe("cameraParameters");
     }
 
     // Update is called once per frame
     void Update()
     {
         updateCameraPosition();
-        RayConstantsGenerator();
-        ParameterFinder();
+        coralRayConstants = RayConstantsGenerator(coralCameraAngles);
+        algaeRayConstants = RayConstantsGenerator(algaeCameraAngles);
+        emptyRayConstants = RayConstantsGenerator(emptyCameraAngles);
+        coralRawIntersections = RawIntersectionFinder(coralRayConstants);
+        algaeRawIntersections = RawIntersectionFinder(algaeRayConstants);
+        emptyRawIntersections = RawIntersectionFinder(emptyRayConstants);
     }
 
     // Method run each time new values are posted to network tables
@@ -81,57 +89,98 @@ public class RayTracing : MonoBehaviour
             robotY = robotPose[1];
             robotZ = robotPose[2];
         }
-        else if (topic.Name == "cameraAngles" && value is double[][][] cameraAngles)
+        else if (topic.Name == "coralCameraAngles" && value is double[][][] coralCameraAngles) // cameraAngles[camera][angles][xPixel, yPixel, width, height] -> // cameraAngles[camera][angles][xAngle, yAngle, width, height]
         {
-            this.cameraAngles = cameraAngles;
+            this.coralCameraAngles = correctCameraAngles(coralCameraAngles);
+        }
+        else if (topic.Name == "algaeCameraAngles" && value is double[][][] algaeCameraAngles)
+        {
+            this.algaeCameraAngles = correctCameraAngles(algaeCameraAngles);
+        }
+        else if (topic.Name == "emptyCameraAngles" && value is double[][][] emptyCameraAngles)
+        {
+            this.emptyCameraAngles = correctCameraAngles(emptyCameraAngles);
         }
         else if (topic.Name == "alliance" && value is String alliance)
         {
             this.alliance = alliance;
         }
-        else if (topic.Name == "cameraOffsets" && value is double[,] cameraOffsets)
+        else if (topic.Name == "cameraOffsets" && value is double[][] cameraOffsets) // cameraOffset[xOffset, yOffset, zOffset, pitch]
         {
             this.cameraOffsets = cameraOffsets;
         }
+        else if (topic.Name == "cameraParameters" && value is int[][] cameraParameters)
+        {
+            this.cameraParameters = cameraParameters; // cameraParameters[camera][xResolution, yResolution, xFov, yFov]
+        }
+    }
+
+    private double[][][] correctCameraAngles(double[][][] cameraAngles)
+    {
+        double[][][] correctAngles = copy3DArray(cameraAngles); // [camera][angles][xPixel -> xAngle, yPixel -> yAngle, width, height]
+        int xPixel, yPixel, xCenter, yCenter;
+        double xFocal, yFocal, xAngle, yAngle;
+        for (int camera = 0; camera < correctAngles.Length; camera++)
+        {
+            for (int angle = 0; angle < correctAngles[camera].Length; angle++)
+            {
+                double[] angleParameters = correctAngles[camera][angle]; // [xPixel, yPixel, width, height]
+                int[] cameraParameters = this.cameraParameters[camera]; // [xResolution, yResolution, xFov, yFov]
+                xCenter = cameraParameters[0] / 2;
+                yCenter = cameraParameters[1] / 2;
+                xPixel = (int)angleParameters[0] - xCenter;
+                yPixel = (int)angleParameters[1] - yCenter;
+                xFocal = angleParameters[2] / (2 * Math.Tan(cameraParameters[2] / 2.0));
+                yFocal = angleParameters[3] / (2 * Math.Tan(cameraParameters[3] / 2.0));
+                xAngle = Math.Atan(xPixel / xFocal);
+                yAngle = Math.Atan(yPixel / yFocal);
+                correctAngles[camera][angle][0] = xAngle;
+                correctAngles[camera][angle][1] = yAngle;
+            }
+        }
+        return correctAngles;
     }
 
     private void updateCameraPosition()
     {
-        cameraPositions = new double[cameraOffsets.GetLength(0), cameraOffsets.GetLength(1)];
+        cameraPositions = copyJaggedArraySize(cameraOffsets);
         // TODO: Ensure robot rotation goes from 0 to 360, not -180 to 180
-        for (int camera = 0; camera < cameraOffsets.GetLength(0); camera++)
+        for (int camera = 0; camera < cameraOffsets.Length; camera++)
         {
-            cameraPositions[camera, 0] = robotX + cameraOffsets[camera, 0] * Math.Cos(robotRotation * (Math.PI / 180)); // X
-            cameraPositions[camera, 1] = robotY + cameraOffsets[camera, 1] * Math.Sin(robotRotation * (Math.PI / 180)); // Y
-            cameraPositions[camera, 2] = cameraOffsets[camera, 2]; // Z
-            cameraPositions[camera, 3] = cameraOffsets[camera, 3]; // Pitch
+            cameraPositions[camera][0] = robotX + cameraOffsets[camera][0] * Math.Cos(robotRotation * (Math.PI / 180)); // X
+            cameraPositions[camera][1] = robotY + cameraOffsets[camera][1] * Math.Sin(robotRotation * (Math.PI / 180)); // Y
+            cameraPositions[camera][2] = cameraOffsets[camera][2]; // Z
+            cameraPositions[camera][3] = cameraOffsets[camera][3]; // Pitch
         }
     }
 
     // TODO: Check assumption that cameraX is left-/right+ while cameraY is up+/down- in frame
-    private void RayConstantsGenerator()
+    // Returns rayConstants[camera][angle][constant]
+    private double[][][] RayConstantsGenerator(double[][][] cameraAngles)
     {
-        rayConstants = Create3DJaggedArrayWithSameBase(cameraAngles, 6); // 0=ax, 1=mx, 2=ay, 3=my, 4=az, 5=mz
+        double[][][] rayConstants = copyOuter2Dof3DArray(cameraAngles, 6); // 0=ax, 1=mx, 2=ay, 3=my, 4=az, 5=mz
         for (int camera = 0; camera < cameraAngles.Length; camera++)
         {
             for (int angle = 0; angle < cameraAngles[camera].Length; angle++)
             {
-                rayConstants[camera][angle][0] = cameraPositions[camera, 0];
-                rayConstants[camera][angle][1] = Math.Cos((cameraAngles[camera][angle][1] + cameraPositions[camera, 3]) * (Math.PI / 180)); // Cos(yAngle + pitch)
-                rayConstants[camera][angle][2] = cameraPositions[camera, 1];
+                rayConstants[camera][angle][0] = cameraPositions[camera][0];
+                rayConstants[camera][angle][1] = Math.Cos((cameraAngles[camera][angle][1] + cameraPositions[camera][3]) * (Math.PI / 180)); // Cos(yAngle + pitch)
+                rayConstants[camera][angle][2] = cameraPositions[camera][1];
                 rayConstants[camera][angle][3] = Math.Sin(-cameraAngles[camera][angle][0] * (Math.PI / 180)); // Sin(-xAngle)
-                rayConstants[camera][angle][4] = cameraPositions[camera, 2];
-                rayConstants[camera][angle][5] = Math.Sin((cameraAngles[camera][angle][1] + cameraPositions[camera, 3]) * (Math.PI / 180)); // Sin(yAngle + pitch)
+                rayConstants[camera][angle][4] = cameraPositions[camera][2];
+                rayConstants[camera][angle][5] = Math.Sin((cameraAngles[camera][angle][1] + cameraPositions[camera][3]) * (Math.PI / 180)); // Sin(yAngle + pitch)
             }
         }
+        return rayConstants;
     }
 
-    private void ParameterFinder()
+    // Returns parameters[camera][angle][t-value]
+    private double[][][] RawIntersectionFinder(double[][][] rayConstants)
     {
-        parameters = new double[GetTotalNumArray3dJagged(rayConstants), 2];
-        double a, b, c, reefX;
-        int count = 0;
+        double[][][] rawIntersections = createNew3DArray(getNumOf1DArrays(rayConstants), 2, 3);
+        double a, b, c, reefX, parameter1, parameter2;
         double[] constants;
+        int count = 0;
         for (int camera = 0; camera < rayConstants.Length; camera++)
         {
             for (int angle = 0; angle < rayConstants[camera].Length; angle++)
@@ -142,34 +191,76 @@ public class RayTracing : MonoBehaviour
                 a = Math.Pow(reefX, 2) + Math.Pow(reefY, 2); // (mx)^2 + (my)^2
                 b = 2 * (constants[1] * (constants[0] - reefX) + constants[3] * (constants[2] - reefY)); // 2((mx)(ax - reefX) + (my)(ay - reefY))
                 c = Math.Pow(constants[0] - reefX, 2) + Math.Pow(constants[2] - reefY, 2) - Math.Pow(radius, 2); // (ax - reefX)^2 + (ay - reefY)^2 - r^2
-                parameters[count, 0] = (-b + Math.Sqrt(Math.Pow(b, 2) - 4 * a * c)) / (2 * a);
-                parameters[count, 1] = (-b - Math.Sqrt(Math.Pow(b, 2) - 4 * a * c)) / (2 * a);
+                parameter1 = (-b + Math.Sqrt(Math.Pow(b, 2) - 4 * a * c)) / (2 * a);
+                parameter2 = (-b - Math.Sqrt(Math.Pow(b, 2) - 4 * a * c)) / (2 * a);
+                rawIntersections[count][0] = new double[] { constants[0] + (constants[1] * parameter1), constants[2] + (constants[3] * parameter1), constants[4] + (constants[5] * parameter1) };
+                rawIntersections[count][1] = new double[] { constants[0] + (constants[1] * parameter2), constants[2] + (constants[3] * parameter2), constants[4] + (constants[5] * parameter2) };
                 count++;
             }
         }
+        return rawIntersections;
     }
 
-    private static double[][][] Create3DJaggedArrayWithSameBase(double[][][] original, int finalColumnNumber)
+    private double[][] copyJaggedArraySize(double[][] original)
+    {
+        double[][] newArray = new double[original.Length][];
+        for (int i = 0; i < original.Length; i++)
+        {
+            newArray[i] = new double[original[i].Length];
+        }
+        return newArray;
+    }
+
+    private double[][][] copyOuter2Dof3DArray(double[][][] original, int lastDimension)
     {
         double[][][] newArray = new double[original.Length][][];
         for (int i = 0; i < original.Length; i++)
         {
             newArray[i] = new double[original[i].Length][];
-            for (int j = 0; j < newArray[i].Length; j++)
+            for (int j = 0; j < original[i].Length; j++)
             {
-                newArray[i][j] = new double[finalColumnNumber];
+                newArray[i][j] = new double[lastDimension];
             }
         }
         return newArray;
     }
 
-    public int GetTotalNumArray3dJagged(double[][][] jaggedArray)
+    private double[][][] createNew3DArray(int D1, int D2, int D3)
     {
-        int count = 0;
-        for (int i = 0; i < jaggedArray.Length; i++)
+        double[][][] array = new double[D1][][];
+        for (int i = 0; i < D1; i++)
         {
-            count += jaggedArray[i].Length;
+            array[i] = new double[D2][];
+            for (int j = 0; j < D2; j++)
+            {
+                array[i][j] = new double[D3];
+            }
         }
-        return count;
+        return array;
+    }
+
+    private int getNumOf1DArrays(double[][][] array)
+    {
+        int numArrays = 0;
+        for (int i = 0; i < array.Length; i++)
+        {
+            numArrays += array[i].Length;
+        }
+        return numArrays;
+    }
+
+    private double[][][] copy3DArray(double[][][] original)
+    {
+        double[][][] newArray = new double[original.Length][][];
+        for (int i = 0; i < original.Length; i++)
+        {
+            newArray[i] = new double[original[i].Length][];
+            for (int j = 0; j < original[i].Length; j++)
+            {
+                newArray[i][j] = new double[original[i][j].Length];
+                Array.Copy(original[i][j], newArray[i][j], original[i][j].Length);
+            }
+        }
+        return newArray;
     }
 }
