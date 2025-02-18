@@ -1,12 +1,14 @@
 using System;
 using NetworkTables;
+using Unity.Mathematics;
 using UnityEngine;
 
 public class RayTracing : MonoBehaviour
 {
     private Nt4Client _ntClient;
     private double robotX = 0.0, robotY = 0.0, robotZ = 0.0, robotRotation = 0.0;
-    private double[][] cameraOffsets = new double[0][], cameraPositions = new double[0][];
+    private double[] coralDistanceEstimates = new double[0], algaeDistanceEstimates = new double[0], emptyDistanceEstimates = new double[0];
+    private double[][] cameraOffsets = new double[0][], cameraPositions = new double[0][], coralValidIntersections = new double[0][], algaeValidIntersections = new double[0][], emptyValidIntersections = new double[0][], coralCorrectIntersections = new double[0][], algaeCorrectIntersections = new double[0][], emptyCorrectIntersections = new double[0][];
     private int[][] cameraParameters = new int[0][];
     private double[][][] coralCameraAngles = new double[0][][], algaeCameraAngles = new double[0][][], emptyCameraAngles = new double[0][][], coralRayConstants = new double[0][][], algaeRayConstants = new double[0][][], emptyRayConstants = new double[0][][], coralRawIntersections = new double[0][][], algaeRawIntersections = new double[0][][], emptyRawIntersections = new double[0][][];
     private String alliance = "Blue";
@@ -15,6 +17,7 @@ public class RayTracing : MonoBehaviour
     // Field Constants
     private const double blueReefX = 4.48945, reedReefX = 13.065, reefY = 4.0259, radius = 0.658;
     private const double L1 = 0.4572, L2 = 0.70358, L3 = 1.106678, L4 = 1.652778;
+    private readonly double[] coralHeights = new double[] {L1, L2, L3, L4};
     private readonly double[,] blueCoral = new double[,] {
         {3.822, 4.2}, {3.822, 3.859}, // A & B
         {4.0, 3.547}, {4.319, 3.372}, // C & D
@@ -32,6 +35,7 @@ public class RayTracing : MonoBehaviour
         {13.221, 3.372}, {13.54, 3.547} // K & L
     };
     private const double L23 = 0.905129, L34 = 1.308227;
+    private readonly double[] algaeHeights = new double[] {L23, L34};
     private readonly double[,] blueAlgae = new double[,] {
         {3.803, 4.025, L34}, // A & B
         {4.144, 3.42, L23}, // C & D
@@ -77,6 +81,15 @@ public class RayTracing : MonoBehaviour
         coralRawIntersections = RawIntersectionFinder(coralRayConstants);
         algaeRawIntersections = RawIntersectionFinder(algaeRayConstants);
         emptyRawIntersections = RawIntersectionFinder(emptyRayConstants);
+        coralDistanceEstimates = getDistanceEstimates(coralCameraAngles);
+        algaeDistanceEstimates = getDistanceEstimates(algaeCameraAngles);
+        emptyDistanceEstimates = getDistanceEstimates(emptyCameraAngles);
+        coralValidIntersections = declareValidIntersections(coralRawIntersections, coralDistanceEstimates);
+        algaeValidIntersections = declareValidIntersections(algaeRawIntersections, algaeDistanceEstimates);
+        emptyValidIntersections = declareValidIntersections(emptyRawIntersections, emptyDistanceEstimates);
+        coralCorrectIntersections = findCorrectIntersections(coralValidIntersections, "coral");
+        algaeCorrectIntersections = findCorrectIntersections(algaeValidIntersections, "algae");
+        emptyCorrectIntersections = findCorrectIntersections(emptyValidIntersections, "empty");
     }
 
     // Method run each time new values are posted to network tables
@@ -97,7 +110,7 @@ public class RayTracing : MonoBehaviour
         {
             this.algaeCameraAngles = correctCameraAngles(algaeCameraAngles);
         }
-        else if (topic.Name == "emptyCameraAngles" && value is double[][][] emptyCameraAngles)
+        else if (topic.Name == "emptyCameraAngles" && value is double[][][] emptyCameraAngles) // Likely will need deleted unless a new model is trained
         {
             this.emptyCameraAngles = correctCameraAngles(emptyCameraAngles);
         }
@@ -115,6 +128,7 @@ public class RayTracing : MonoBehaviour
         }
     }
 
+    // Likely will not need this function as camera angles will probably be returned
     private double[][][] correctCameraAngles(double[][][] cameraAngles)
     {
         double[][][] correctAngles = copy3DArray(cameraAngles); // [camera][angles][xPixel -> xAngle, yPixel -> yAngle, width, height]
@@ -143,7 +157,7 @@ public class RayTracing : MonoBehaviour
 
     private void updateCameraPosition()
     {
-        cameraPositions = copyJaggedArraySize(cameraOffsets);
+        cameraPositions = copy2DArraySize(cameraOffsets);
         // TODO: Ensure robot rotation goes from 0 to 360, not -180 to 180
         for (int camera = 0; camera < cameraOffsets.Length; camera++)
         {
@@ -158,7 +172,7 @@ public class RayTracing : MonoBehaviour
     // Returns rayConstants[camera][angle][constant]
     private double[][][] RayConstantsGenerator(double[][][] cameraAngles)
     {
-        double[][][] rayConstants = copyOuter2Dof3DArray(cameraAngles, 6); // 0=ax, 1=mx, 2=ay, 3=my, 4=az, 5=mz
+        double[][][] rayConstants = copyOuter2Dof3DArrayWithFinalColumn(cameraAngles, 6); // 0=ax, 1=mx, 2=ay, 3=my, 4=az, 5=mz
         for (int camera = 0; camera < cameraAngles.Length; camera++)
         {
             for (int angle = 0; angle < cameraAngles[camera].Length; angle++)
@@ -174,10 +188,10 @@ public class RayTracing : MonoBehaviour
         return rayConstants;
     }
 
-    // Returns parameters[camera][angle][t-value]
+    // Returns intersections[intersection set][intersection1, intersection2][x, y, z]
     private double[][][] RawIntersectionFinder(double[][][] rayConstants)
     {
-        double[][][] rawIntersections = createNew3DArray(getNumOf1DArrays(rayConstants), 2, 3);
+        double[][][] rawIntersections = createNew3DArray(getNumOf1DArraysOf3DArray(rayConstants), 2, 3);
         double a, b, c, reefX, parameter1, parameter2;
         double[] constants;
         int count = 0;
@@ -201,7 +215,83 @@ public class RayTracing : MonoBehaviour
         return rawIntersections;
     }
 
-    private double[][] copyJaggedArraySize(double[][] original)
+    private double getEstimatedDistance(double width, double height)
+    {
+        // TODO: Create a function based on collected data to estimate the distance
+        return 0.0;
+    }
+
+    // Returns estimates[estimate]
+    private double[] getDistanceEstimates(double[][][] cameraAngles)
+    {
+        double[] distanceEstimates = new double[getNumOf1DArraysOf3DArray(cameraAngles)];
+        int count = 0;
+        for (int camera = 0; camera < cameraAngles.Length; camera++)
+        {
+            for (int angle = 0; angle < cameraAngles[camera].Length; angle++)
+            {
+                distanceEstimates[count] = getEstimatedDistance(cameraAngles[camera][angle][2], cameraAngles[camera][angle][3]);
+                count++;
+            }
+        }
+        return distanceEstimates;
+    }
+
+    // returns intersections[intersection][x, y, z]
+    private double[][] declareValidIntersections(double[][][] rawIntersections, double[] distanceEstimates)
+    {
+        double[][] validIntersections = createNew2DArray(distanceEstimates.Length, 3);
+        double[] robotPosition = new double[] { robotX, robotY, robotZ };
+        double distance1, distance2;
+        for (int intersectionNum = 0; intersectionNum < rawIntersections.Length; intersectionNum++)
+        {
+            distance1 = get3DDistance(rawIntersections[intersectionNum][0], robotPosition);
+            distance2 = get3DDistance(rawIntersections[intersectionNum][1], robotPosition);
+            validIntersections[intersectionNum] = distance1 - distanceEstimates[intersectionNum] < distance2 - distanceEstimates[intersectionNum] ? rawIntersections[intersectionNum][0] : rawIntersections[intersectionNum][1];
+        }
+        return validIntersections;
+    }
+
+    // returns points[point][x, y, z]
+    private double[][] findCorrectIntersections(double[][] validIntersections, String gamepiece) {
+        double[][] correctIntersections = copy2DArraySize(validIntersections);
+        double[,] correctXYs = new double[0, 0];
+        double[] correctZs = new double[0];
+        if (gamepiece == "coral" || gamepiece == "empty") {
+            correctXYs = alliance == "Blue" ? blueCoral : redCoral;
+            correctZs = coralHeights;
+        } else if (gamepiece == "algae") {
+            correctXYs = alliance == "Blue" ? blueAlgae : redAlgae;
+            correctZs = algaeHeights;
+        }
+        for (int i = 0; i < correctIntersections.Length; i++) {
+            correctIntersections[i] = findCorrectInterseciton(validIntersections[i], correctXYs, correctZs);
+        }
+        return correctIntersections;
+    }
+
+    // returns point[x, y, z]
+    private double[] findCorrectInterseciton(double[] validIntersection, double[,] correctXYs, double[] correctZs) {
+        double correctX = 0, correctY = 0, correctZ = 0, smallestXYDistance = 10, smallestZDistance = 10, xyDistance, zDistance;
+        for (int i = 0; i < correctXYs.GetLength(0); i++) {
+            double[] XY = new double[] {correctXYs[i, 0], correctXYs[i, 1]};
+            xyDistance = get2DDistance(validIntersection, XY);
+            if (xyDistance < smallestXYDistance) {
+                correctX = XY[0];
+                correctY = XY[1];
+                smallestXYDistance = xyDistance;
+            }
+        }
+        foreach (double z in correctZs) {
+            zDistance = Math.Abs(validIntersection[2] - z);
+            if (zDistance < smallestZDistance) {
+                correctZ = z;
+                smallestZDistance = zDistance;
+            }
+        }
+        return new double[] {correctX, correctY, correctZ};
+    }
+    private double[][] copy2DArraySize(double[][] original)
     {
         double[][] newArray = new double[original.Length][];
         for (int i = 0; i < original.Length; i++)
@@ -211,7 +301,7 @@ public class RayTracing : MonoBehaviour
         return newArray;
     }
 
-    private double[][][] copyOuter2Dof3DArray(double[][][] original, int lastDimension)
+    private double[][][] copyOuter2Dof3DArrayWithFinalColumn(double[][][] original, int lastDimension)
     {
         double[][][] newArray = new double[original.Length][][];
         for (int i = 0; i < original.Length; i++)
@@ -239,7 +329,17 @@ public class RayTracing : MonoBehaviour
         return array;
     }
 
-    private int getNumOf1DArrays(double[][][] array)
+    private double[][] createNew2DArray(int D1, int D2)
+    {
+        double[][] newArray = new double[D1][];
+        for (int i = 0; i < D1; i++)
+        {
+            newArray[i] = new double[D2];
+        }
+        return newArray;
+    }
+
+    private int getNumOf1DArraysOf3DArray(double[][][] array)
     {
         int numArrays = 0;
         for (int i = 0; i < array.Length; i++)
@@ -262,5 +362,14 @@ public class RayTracing : MonoBehaviour
             }
         }
         return newArray;
+    }
+
+    private double get3DDistance(double[] point1, double[] point2)
+    {
+        return Math.Sqrt(Math.Pow(point2[0] - point1[0], 2) + Math.Pow(point2[1] - point1[1], 2) + Math.Pow(point2[2] - point1[2], 2));
+    }
+
+    private double get2DDistance(double[] point1, double[] point2) {
+        return Math.Sqrt(Math.Pow(point2[0] - point1[0], 2) + Math.Pow(point2[1] - point1[1], 2));
     }
 }
