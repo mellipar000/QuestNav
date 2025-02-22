@@ -1,18 +1,24 @@
 using System;
+using System.Numerics;
 using NetworkTables;
 using Unity.Mathematics;
 using UnityEngine;
+using Matrix4x4 = UnityEngine.Matrix4x4;
+using Vector3 = UnityEngine.Vector3;
+using Vector4 = UnityEngine.Vector4;
 
 public class RayTracing : MonoBehaviour
 {
     private Nt4Client _ntClient;
     private double robotX = 0.0, robotY = 0.0, robotZ = 0.0, robotRotation = 0.0;
-    private double[] coralDistanceEstimates = new double[0], algaeDistanceEstimates = new double[0], emptyDistanceEstimates = new double[0];
-    private double[][] cameraOffsets = new double[0][], cameraPositions = new double[0][], coralValidIntersections = new double[0][], algaeValidIntersections = new double[0][], emptyValidIntersections = new double[0][], coralCorrectIntersections = new double[0][], algaeCorrectIntersections = new double[0][], emptyCorrectIntersections = new double[0][];
+    private int[] coralCounters = new int[48], algaeCounters = new int[6], emptyCoralCounters = new int[48], emptyAlgaeCounters = new int[6];
+    private bool[] coralPresence = new bool[12], algaePresence = new bool[12], hasSeenCoral = new bool[12], hasSeenAlgae = new bool[12], coralVisibilities = new bool[0], algaeVisibilities = new bool[0]; // presence arrays iterate through all heights of each XY before moving on to the next XY
+    private double[] coralDistanceEstimates = new double[0], algaeDistanceEstimates = new double[0];
+    private double[][] cameraOffsets = new double[0][], cameraPositions = new double[0][], coralValidIntersections = new double[0][], algaeValidIntersections = new double[0][], coralCorrectIntersections = new double[0][], algaeCorrectIntersections = new double[0][];
     private int[][] cameraParameters = new int[0][];
-    private double[][][] coralCameraAngles = new double[0][][], algaeCameraAngles = new double[0][][], emptyCameraAngles = new double[0][][], coralRayConstants = new double[0][][], algaeRayConstants = new double[0][][], emptyRayConstants = new double[0][][], coralRawIntersections = new double[0][][], algaeRawIntersections = new double[0][][], emptyRawIntersections = new double[0][][];
+    private double[][][] coralCameraAngles = new double[0][][], algaeCameraAngles = new double[0][][], coralRayConstants = new double[0][][], algaeRayConstants = new double[0][][], coralRawIntersections = new double[0][][], algaeRawIntersections = new double[0][][];
     private String alliance = "Blue";
-    private int _cameraOffsetsSubscriptionId, _coralCameraAnglesSubscriptionId, _algaeCameraAnglesSubscriptionId, _emptyCameraAnglesSubscriptionId, _robotPositionSubscriptionId, _allianceSubscriptionId, _cameraParametersSubscriptionId;
+    private int _cameraOffsetsSubscriptionId, _coralCameraAnglesSubscriptionId, _algaeCameraAnglesSubscriptionId, _robotPositionSubscriptionId, _allianceSubscriptionId, _cameraParametersSubscriptionId, framePresenceThreshold = 40;
 
     // Field Constants
     private const double blueReefX = 4.48945, reedReefX = 13.065, reefY = 4.0259, radius = 0.658;
@@ -53,6 +59,8 @@ public class RayTracing : MonoBehaviour
         {13.396, 3.42, L23} // K & L
     };
 
+    private double[,] coralXYPositions = new double[0, 0], algaePositions = new double[0, 0];
+
     // Start is called once before the first execution of Update after the MonoBehaviour is created
     void Start()
     {
@@ -65,7 +73,6 @@ public class RayTracing : MonoBehaviour
         _cameraOffsetsSubscriptionId = _ntClient.Subscribe("cameraOffsets");
         _coralCameraAnglesSubscriptionId = _ntClient.Subscribe("coralCameraAngles");
         _algaeCameraAnglesSubscriptionId = _ntClient.Subscribe("coralCameraAngles");
-        _emptyCameraAnglesSubscriptionId = _ntClient.Subscribe("coralCameraAngles");
         _robotPositionSubscriptionId = _ntClient.Subscribe("robotPosition");
         _allianceSubscriptionId = _ntClient.Subscribe("alliance");
         _cameraParametersSubscriptionId = _ntClient.Subscribe("cameraParameters");
@@ -74,47 +81,50 @@ public class RayTracing : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
+        coralXYPositions = alliance == "Blue" ? blueCoral : redCoral;
+        algaePositions = alliance == "Blue" ? blueAlgae : redAlgae;
         updateCameraPosition();
         coralRayConstants = RayConstantsGenerator(coralCameraAngles);
         algaeRayConstants = RayConstantsGenerator(algaeCameraAngles);
-        emptyRayConstants = RayConstantsGenerator(emptyCameraAngles);
         coralRawIntersections = RawIntersectionFinder(coralRayConstants);
         algaeRawIntersections = RawIntersectionFinder(algaeRayConstants);
-        emptyRawIntersections = RawIntersectionFinder(emptyRayConstants);
         coralDistanceEstimates = getDistanceEstimates(coralCameraAngles);
         algaeDistanceEstimates = getDistanceEstimates(algaeCameraAngles);
-        emptyDistanceEstimates = getDistanceEstimates(emptyCameraAngles);
         coralValidIntersections = declareValidIntersections(coralRawIntersections, coralDistanceEstimates);
         algaeValidIntersections = declareValidIntersections(algaeRawIntersections, algaeDistanceEstimates);
-        emptyValidIntersections = declareValidIntersections(emptyRawIntersections, emptyDistanceEstimates);
-        coralCorrectIntersections = findCorrectIntersections(coralValidIntersections, "coral");
-        algaeCorrectIntersections = findCorrectIntersections(algaeValidIntersections, "algae");
-        emptyCorrectIntersections = findCorrectIntersections(emptyValidIntersections, "empty");
+        coralCorrectIntersections = findCorrectIntersectionsAndUpdateCounters(coralValidIntersections, hasSeenCoral, "coral");
+        algaeCorrectIntersections = findCorrectIntersectionsAndUpdateCounters(algaeValidIntersections, hasSeenAlgae, "algae");
+        coralVisibilities = checkCoralVisibilies();
+        algaeVisibilities = checkAlgaeVisibilies();
+        updateEmptyCounters(emptyCoralCounters, hasSeenCoral, coralVisibilities);
+        updateEmptyCounters(emptyAlgaeCounters, hasSeenAlgae, algaeVisibilities);
+        checkEmptyCoralCounters();
+        updateGamepiecePresence(coralPresence, coralCounters);
+        updateGamepiecePresence(algaePresence, algaeCounters);
+        publishValues();
+        resetValues();
     }
 
     // Method run each time new values are posted to network tables
     // TODO: Ensure robot code publishes jagged arrays for cameraAngles or change method
     private void OnNewTopicData(Nt4Topic topic, long timestamp, object value)
     {
-        if (topic.Name == "robotPosition" && value is double[] robotPose && robotPose.Length == 3)
+        if (topic.Name == "robotPosition" && value is double[] robotPose && robotPose.Length == 4)
         {
             robotX = robotPose[0];
             robotY = robotPose[1];
             robotZ = robotPose[2];
+            robotRotation = robotPose[3] + 180; // TODO: Check assumption that robot rotation is from -180 to 180
         }
-        else if (topic.Name == "coralCameraAngles" && value is double[][][] coralCameraAngles) // cameraAngles[camera][angles][xPixel, yPixel, width, height] -> // cameraAngles[camera][angles][xAngle, yAngle, width, height]
+        else if (topic.Name == "coralCameraAngles" && value is double[][][] coralCameraAngles) // cameraAngles[camera][angles][xAngle, yAngle, width, height]
         {
-            this.coralCameraAngles = correctCameraAngles(coralCameraAngles);
+            this.coralCameraAngles = coralCameraAngles;
         }
-        else if (topic.Name == "algaeCameraAngles" && value is double[][][] algaeCameraAngles)
+        else if (topic.Name == "algaeCameraAngles" && value is double[][][] algaeCameraAngles) // cameraAngles[camera][angles][xAngle, yAngle, width, height]
         {
-            this.algaeCameraAngles = correctCameraAngles(algaeCameraAngles);
+            this.algaeCameraAngles = algaeCameraAngles;
         }
-        else if (topic.Name == "emptyCameraAngles" && value is double[][][] emptyCameraAngles) // Likely will need deleted unless a new model is trained
-        {
-            this.emptyCameraAngles = correctCameraAngles(emptyCameraAngles);
-        }
-        else if (topic.Name == "alliance" && value is String alliance)
+        else if (topic.Name == "alliance" && value is String alliance) // "Blue" or "Red"
         {
             this.alliance = alliance;
         }
@@ -122,9 +132,9 @@ public class RayTracing : MonoBehaviour
         {
             this.cameraOffsets = cameraOffsets;
         }
-        else if (topic.Name == "cameraParameters" && value is int[][] cameraParameters)
+        else if (topic.Name == "cameraParameters" && value is int[][] cameraParameters) // cameraParameters[camera][xResolution, yResolution, xFov, yFov]
         {
-            this.cameraParameters = cameraParameters; // cameraParameters[camera][xResolution, yResolution, xFov, yFov]
+            this.cameraParameters = cameraParameters; 
         }
     }
 
@@ -155,16 +165,17 @@ public class RayTracing : MonoBehaviour
         return correctAngles;
     }
 
+    // returns cameraPositions[camera][x, y, z, pitch]
     private void updateCameraPosition()
     {
         cameraPositions = copy2DArraySize(cameraOffsets);
-        // TODO: Ensure robot rotation goes from 0 to 360, not -180 to 180
         for (int camera = 0; camera < cameraOffsets.Length; camera++)
         {
             cameraPositions[camera][0] = robotX + cameraOffsets[camera][0] * Math.Cos(robotRotation * (Math.PI / 180)); // X
             cameraPositions[camera][1] = robotY + cameraOffsets[camera][1] * Math.Sin(robotRotation * (Math.PI / 180)); // Y
             cameraPositions[camera][2] = cameraOffsets[camera][2]; // Z
             cameraPositions[camera][3] = cameraOffsets[camera][3]; // Pitch
+            cameraPositions[camera][4] = cameraOffsets[camera][4]; // Yaw
         }
     }
 
@@ -253,26 +264,28 @@ public class RayTracing : MonoBehaviour
     }
 
     // returns points[point][x, y, z]
-    private double[][] findCorrectIntersections(double[][] validIntersections, String gamepiece) {
+    private double[][] findCorrectIntersectionsAndUpdateCounters(double[][] validIntersections, bool[] hasSeen, String gamepiece) {
         double[][] correctIntersections = copy2DArraySize(validIntersections);
-        double[,] correctXYs = new double[0, 0];
+        double[,] correctXYs = coralXYPositions;
         double[] correctZs = new double[0];
-        if (gamepiece == "coral" || gamepiece == "empty") {
-            correctXYs = alliance == "Blue" ? blueCoral : redCoral;
+        int[] counters = new int[0];
+        if (gamepiece == "coral") {
             correctZs = coralHeights;
+            counters = coralCounters;
         } else if (gamepiece == "algae") {
-            correctXYs = alliance == "Blue" ? blueAlgae : redAlgae;
             correctZs = algaeHeights;
+            counters = algaeCounters;
         }
         for (int i = 0; i < correctIntersections.Length; i++) {
-            correctIntersections[i] = findCorrectInterseciton(validIntersections[i], correctXYs, correctZs);
+            correctIntersections[i] = findCorrectIntersectionAndUpdateCounter(validIntersections[i], correctXYs, correctZs, counters, hasSeen, gamepiece);
         }
         return correctIntersections;
     }
 
-    // returns point[x, y, z]
-    private double[] findCorrectInterseciton(double[] validIntersection, double[,] correctXYs, double[] correctZs) {
+    // returns points[x, y, z]
+    private double[] findCorrectIntersectionAndUpdateCounter(double[] validIntersection, double[,] correctXYs, double[] correctZs, int[] counters, bool[] hasSeen, String gamepiece) {
         double correctX = 0, correctY = 0, correctZ = 0, smallestXYDistance = 10, smallestZDistance = 10, xyDistance, zDistance;
+        int correctXYIndex = 0, correctZIndex = 0, correctIndex = 0;
         for (int i = 0; i < correctXYs.GetLength(0); i++) {
             double[] XY = new double[] {correctXYs[i, 0], correctXYs[i, 1]};
             xyDistance = get2DDistance(validIntersection, XY);
@@ -280,17 +293,157 @@ public class RayTracing : MonoBehaviour
                 correctX = XY[0];
                 correctY = XY[1];
                 smallestXYDistance = xyDistance;
+                correctXYIndex = i;
             }
         }
-        foreach (double z in correctZs) {
-            zDistance = Math.Abs(validIntersection[2] - z);
+        for (int i = 0; i < correctZs.Length; i++) {
+            zDistance = Math.Abs(validIntersection[2] - correctZs[i]);
             if (zDistance < smallestZDistance) {
-                correctZ = z;
+                correctZ = correctZs[i];
                 smallestZDistance = zDistance;
+                correctZIndex = i;
             }
         }
+        correctIndex = gamepiece == "coral" ?  correctXYIndex * correctZs.Length + correctZIndex : correctXYIndex;
+        counters[correctIndex]++;
+        hasSeen[correctIndex] = true;
         return new double[] {correctX, correctY, correctZ};
     }
+
+    private void checkEmptyCoralCounters() {
+        for (int i = 0; i < emptyCoralCounters.Length; i++) {
+            if (emptyCoralCounters[i] > 0) {
+                coralCounters[i] = 0;
+            }
+        }
+    }
+
+    private void updateGamepiecePresence(bool[] pieceStates, int[] counters) {
+        for (int i = 0; i < counters.Length; i++) {
+            if (counters[i] > framePresenceThreshold) {
+                pieceStates[i] = true;
+            } else if (counters[i] == 0) {
+                pieceStates[i] = false;
+            }
+        }
+    }
+
+    private void updateEmptyCountersBasedOnVisibility(double[] emptyCounters, double[,] correctXYs, double[] correctZs) {
+        for (int i = 0; i < correctXYs.Length; i++) {
+            for (int j = 0; j < correctZs.Length; j++) {
+
+            }
+        }
+    }
+
+    // returns visible[coral]
+    private bool[] checkCoralVisibilies() {
+        bool[] coralVisibilities = new bool[coralCounters.Length];
+        for (int i = 0; i < cameraPositions.Length; i++) {
+            for (int j = 0; j < coralXYPositions.GetLength(0); j++) {
+                for (int k = 0; k < coralHeights.Length; k++) {
+                    double[] cameraPosition = cameraPositions[i];
+                    if (IsVisible(new Vector3((float) cameraPosition[0], (float) cameraPosition[1], (float) cameraPosition[2]), (float) cameraPosition[4], (float) cameraPosition[3], (float) cameraParameters[i][2], (float) cameraParameters[i][3], new Vector3((float) coralXYPositions[j, 0], (float) coralXYPositions[j, 1], (float) coralHeights[k]))) {
+                        coralVisibilities[j * coralHeights.Length + k] = true;
+                    }
+                }
+            }
+        }
+        return coralVisibilities;
+    }
+
+    private bool[] checkAlgaeVisibilies() {
+        bool[] algaeVisibilities = new bool[algaeCounters.Length];
+        for (int i = 0; i < cameraPositions.Length; i++) {
+            for (int j = 0; j < algaePositions.GetLength(0); j++) {
+                double[] cameraPosition = cameraPositions[i];
+                    if (IsVisible(new Vector3((float) cameraPosition[0], (float) cameraPosition[1], (float) cameraPosition[2]), (float) cameraPosition[4], (float) cameraPosition[3], (float) cameraParameters[i][2], (float) cameraParameters[i][3], new Vector3((float) algaePositions[j, 0], (float) algaePositions[j, 1], (float) algaePositions[j, 2]))) {
+                        algaeVisibilities[j] = true;
+                    }
+            }
+        }
+        return algaeVisibilities;
+    }
+
+    private bool IsVisible(Vector3 cameraPos, float yaw, float pitch, float fovX, float fovY, Vector3 objectPos)
+    {
+        // Convert degrees to radians
+        yaw = Mathf.Deg2Rad * yaw;
+        pitch = Mathf.Deg2Rad * pitch;
+        float halfFovX = fovX * Mathf.Deg2Rad / 2;
+        float halfFovY = fovY * Mathf.Deg2Rad / 2;
+
+        // Compute camera coordinate system (right, up, forward vectors)
+        Vector3 forward = new Vector3(
+            Mathf.Cos(pitch) * Mathf.Cos(yaw),
+            Mathf.Sin(pitch),
+            Mathf.Cos(pitch) * Mathf.Sin(yaw)
+        );
+
+        Vector3 right = new Vector3(-Mathf.Sin(yaw), 0, Mathf.Cos(yaw));  // Right direction
+        Vector3 up = Vector3.Cross(forward, right);  // Up direction using cross product
+
+        // Construct the transformation matrix
+        Matrix4x4 cameraMatrix = new Matrix4x4();
+        cameraMatrix.SetColumn(0, new Vector4(right.x, right.y, right.z, 0));
+        cameraMatrix.SetColumn(1, new Vector4(up.x, up.y, up.z, 0));
+        cameraMatrix.SetColumn(2, new Vector4(forward.x, forward.y, forward.z, 0));
+        cameraMatrix.SetColumn(3, new Vector4(cameraPos.x, cameraPos.y, cameraPos.z, 1));
+
+        // Convert object position to camera space
+        Vector3 relativePos = objectPos - cameraPos;
+        Vector3 objectInCameraSpace = cameraMatrix.inverse.MultiplyPoint3x4(relativePos);
+
+        // Get the transformed coordinates
+        float Vx = objectInCameraSpace.x;
+        float Vy = objectInCameraSpace.y;
+        float Vz = objectInCameraSpace.z;
+
+        // Ensure the object is in front of the camera
+        if (Vz <= 0) return false;
+
+        // Compute angles
+        float thetaX = Mathf.Atan2(Vx, Vz);
+        float thetaY = Mathf.Atan2(Vy, Vz);
+
+        // Check if within FOV
+        return Mathf.Abs(thetaX) <= halfFovX && Mathf.Abs(thetaY) <= halfFovY;
+    }
+
+    private void updateEmptyCounters(int[] emptyCounters, bool[] hasSeen, bool[] isVisible) {
+        for (int i = 0; i < emptyCounters.Length; i++) {
+            if (isVisible[i] && !hasSeen[i]) {
+                emptyCounters[i]++;
+            } else if (hasSeen[i]) {
+                emptyCounters[i] = 0;
+            }
+        }
+    }
+
+    private void publishValues() {
+        _ntClient.PublishValue("Coral Presence", coralPresence);
+        _ntClient.PublishValue("Algae Presence", algaePresence);
+    }
+
+    private void resetValues() {
+        hasSeenCoral = new bool[12];
+        hasSeenAlgae = new bool[12];
+        coralVisibilities = new bool[0];
+        algaeVisibilities = new bool[0];
+        coralDistanceEstimates = new double[0];
+        algaeDistanceEstimates = new double[0];
+        coralValidIntersections = new double[0][];
+        algaeValidIntersections = new double[0][];
+        coralCorrectIntersections = new double[0][];
+        algaeCorrectIntersections = new double[0][];
+        coralCameraAngles = new double[0][][];
+        algaeCameraAngles = new double[0][][];
+        coralRayConstants = new double[0][][];
+        algaeRayConstants = new double[0][][];
+        coralRawIntersections = new double[0][][];
+        algaeRawIntersections = new double[0][][];
+    }
+
     private double[][] copy2DArraySize(double[][] original)
     {
         double[][] newArray = new double[original.Length][];
